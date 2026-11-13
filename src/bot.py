@@ -513,12 +513,14 @@ class TradingBot:
         )
 
     async def _process_emergency_close_results(self, results, reason: str) -> None:
-        """Persist and report circuit-breaker closes using executor-confirmed results."""
+        """Persist and report only fully confirmed circuit-breaker closes."""
         for result in results:
             trade = result.trade_record
             if not result.success or not trade:
                 error = result.error or (
-                    "Emergency close did not return a completed trade record"
+                    "Executor reported a close without a completed trade record"
+                    if result.success else
+                    "Emergency close was not fully confirmed"
                 )
                 log.critical(
                     "circuit_breaker_emergency_close_incomplete",
@@ -530,8 +532,8 @@ class TradingBot:
                     error=error,
                     breaker_reason=reason,
                 )
-                # An unclosed or unaccounted position must not be increased.
-                self.circuit_breakers._halt_trading(600)
+                # Failed/partial close leaves exposure open; prevent new risk.
+                self.circuit_breakers._halt_trading(3600)
                 try:
                     await self.telegram.send_circuit_breaker_alert(
                         "emergency_close_incomplete",
@@ -552,61 +554,71 @@ class TradingBot:
                     )
                 continue
 
+            # Attempt each reporting destination independently. A failure in
+            # one destination must not suppress the others or later results.
+            reporting_errors: list[str] = []
             try:
                 self.memory.record_trade(trade)
             except Exception as memory_error:
+                reporting_errors.append(f"memory: {memory_error}")
                 log.critical(
                     "emergency_close_memory_record_failed",
                     symbol=result.symbol,
                     order_id=result.order_id,
                     error=str(memory_error),
                 )
-                self.circuit_breakers._halt_trading(600)
 
             try:
                 await self.db.save_trade(trade)
             except Exception as db_error:
+                reporting_errors.append(f"database: {db_error}")
                 log.critical(
                     "emergency_close_trade_persistence_failed",
                     symbol=result.symbol,
                     order_id=result.order_id,
                     error=str(db_error),
                 )
-                self.circuit_breakers._halt_trading(600)
-                try:
-                    await self.telegram.send_circuit_breaker_alert(
-                        "emergency_close_persistence_failed",
-                        "HALT_NEW",
-                        (
-                            f"Exchange confirmed emergency close for {result.symbol}, "
-                            f"but saving its trade record failed: {db_error}"
-                        ),
-                    )
-                except Exception as alert_error:
-                    log.error(
-                        "emergency_close_persistence_alert_failed",
-                        symbol=result.symbol,
-                        error=str(alert_error),
-                    )
 
             try:
                 await self.telegram.notify_trade_close(
-                    symbol=trade["symbol"],
-                    side=trade["side"],
-                    entry_price=trade["entry_price"],
-                    exit_price=result.price or trade["exit_price"],
-                    pnl=trade["pnl"],
-                    pnl_pct=trade["pnl_pct"],
+                    symbol=result.symbol,
+                    side=trade.get("side", result.side),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=result.price or trade.get("exit_price", 0),
+                    pnl=trade.get("pnl", 0),
+                    pnl_pct=trade.get("pnl_pct", 0),
                     duration=trade.get("duration", "N/A"),
                     reasoning=f"Circuit-breaker emergency close: {reason}",
                 )
             except Exception as notify_error:
+                reporting_errors.append(f"telegram: {notify_error}")
                 log.error(
                     "emergency_close_notification_failed",
                     symbol=result.symbol,
                     order_id=result.order_id,
                     error=str(notify_error),
                 )
+
+            if reporting_errors:
+                # Execution happened, but incomplete accounting/reporting
+                # still requires a halt and an explicit operator alert.
+                self.circuit_breakers._halt_trading(3600)
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_reporting_failed",
+                        "HALT_NEW",
+                        (
+                            f"Exchange confirmed emergency close for {result.symbol}, "
+                            f"but post-close reporting failed: "
+                            f"{'; '.join(reporting_errors)}. Trigger: {reason}"
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_reporting_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
 
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
