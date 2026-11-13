@@ -24,7 +24,7 @@ from src.data.sentiment import SentimentCollector
 from src.data.stablecoin import USDTMonitor
 from src.data.top_traders import TopTraderCollector
 from src.data.websocket import WebSocketManager
-from src.execution.executor import TradeExecutor
+from src.execution.executor import ExecutionResult, TradeExecutor
 from src.execution.position_manager import PositionManager
 from src.llm.client import TradingLLMClient
 from src.llm.cost_tracker import CostTracker
@@ -511,6 +511,112 @@ class TradingBot:
             duration=trade.get("duration", "N/A"),
             reasoning="Margin liquidation-buffer force-close",
         )
+
+    async def _process_emergency_close_results(
+        self, results: list[ExecutionResult],
+    ) -> None:
+        """Persist and report only fully confirmed emergency position closes."""
+        for result in results:
+            trade = result.trade_record
+            if not result.success or not trade:
+                error = result.error or (
+                    "Executor reported a close without a completed trade record"
+                    if result.success else
+                    "Emergency close was not fully confirmed"
+                )
+                log.critical(
+                    "emergency_close_not_confirmed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    order_status=result.order_status,
+                    filled_size=result.filled_size,
+                    remaining_size=result.remaining_size,
+                    error=error,
+                )
+                # A failed/partial emergency close leaves exposure open.
+                # Extend the halt rather than allowing new risk to be added.
+                self.circuit_breakers._halt_trading(3600)
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_failed",
+                        "HALT_NEW",
+                        (
+                            f"Emergency close for {result.symbol} was not fully "
+                            f"confirmed: {error}. Filled: {result.filled_size}; "
+                            f"remaining open: {result.remaining_size}."
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_failure_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
+                continue
+
+            # An exchange-confirmed close is a completed trade. Try each
+            # reporting destination independently so one failure does not
+            # suppress the others or prevent processing the remaining results.
+            reporting_errors: list[str] = []
+            try:
+                self.memory.record_trade(trade)
+            except Exception as e:
+                reporting_errors.append(f"memory: {e}")
+                log.error(
+                    "emergency_close_memory_record_failed",
+                    symbol=result.symbol,
+                    error=str(e),
+                )
+
+            try:
+                await self.db.save_trade(trade)
+            except Exception as e:
+                reporting_errors.append(f"database: {e}")
+                log.error(
+                    "emergency_close_database_save_failed",
+                    symbol=result.symbol,
+                    error=str(e),
+                )
+
+            try:
+                await self.telegram.notify_trade_close(
+                    symbol=result.symbol,
+                    side=trade.get("side", result.side),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=result.price or trade.get("exit_price", 0),
+                    pnl=trade.get("pnl", 0),
+                    pnl_pct=trade.get("pnl_pct", 0),
+                    duration=trade.get("duration", "N/A"),
+                    reasoning="Emergency circuit-breaker close",
+                )
+            except Exception as e:
+                reporting_errors.append(f"telegram: {e}")
+                log.error(
+                    "emergency_close_telegram_notification_failed",
+                    symbol=result.symbol,
+                    error=str(e),
+                )
+
+            if reporting_errors:
+                # Execution succeeded, but incomplete accounting/reporting is
+                # still operationally unsafe; prevent new entries until reviewed.
+                self.circuit_breakers._halt_trading(3600)
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_reporting_failed",
+                        "HALT_NEW",
+                        (
+                            f"Exchange close for {result.symbol} was confirmed, "
+                            f"but post-close reporting failed: "
+                            f"{'; '.join(reporting_errors)}"
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_reporting_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
 
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
