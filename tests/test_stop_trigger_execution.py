@@ -388,7 +388,7 @@ async def test_partial_emergency_close_is_alerted_and_not_recorded_as_completed(
     bot.memory.record_trade.assert_not_called()
     bot.db.save_trade.assert_not_awaited()
     bot.telegram.notify_trade_close.assert_not_awaited()
-    bot.circuit_breakers._halt_trading.assert_called_once_with(600)
+    bot.circuit_breakers._halt_trading.assert_called_once_with(3600)
     bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
     alert_args = bot.telegram.send_circuit_breaker_alert.await_args.args
     assert alert_args[0] == "emergency_close_incomplete"
