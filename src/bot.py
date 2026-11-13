@@ -512,6 +512,102 @@ class TradingBot:
             reasoning="Margin liquidation-buffer force-close",
         )
 
+    async def _process_emergency_close_results(self, results, reason: str) -> None:
+        """Persist and report circuit-breaker closes using executor-confirmed results."""
+        for result in results:
+            trade = result.trade_record
+            if not result.success or not trade:
+                error = result.error or (
+                    "Emergency close did not return a completed trade record"
+                )
+                log.critical(
+                    "circuit_breaker_emergency_close_incomplete",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    order_status=result.order_status,
+                    filled_size=result.filled_size,
+                    remaining_size=result.remaining_size,
+                    error=error,
+                    breaker_reason=reason,
+                )
+                # An unclosed or unaccounted position must not be increased.
+                self.circuit_breakers._halt_trading(600)
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_incomplete",
+                        "HALT_NEW",
+                        (
+                            f"Circuit-breaker close for {result.symbol} was not "
+                            f"fully confirmed/accounted: {error}. "
+                            f"Filled: {result.filled_size}; "
+                            f"remaining open: {result.remaining_size}. "
+                            f"Trigger: {reason}"
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_failure_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
+                continue
+
+            try:
+                self.memory.record_trade(trade)
+            except Exception as memory_error:
+                log.critical(
+                    "emergency_close_memory_record_failed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    error=str(memory_error),
+                )
+                self.circuit_breakers._halt_trading(600)
+
+            try:
+                await self.db.save_trade(trade)
+            except Exception as db_error:
+                log.critical(
+                    "emergency_close_trade_persistence_failed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    error=str(db_error),
+                )
+                self.circuit_breakers._halt_trading(600)
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_persistence_failed",
+                        "HALT_NEW",
+                        (
+                            f"Exchange confirmed emergency close for {result.symbol}, "
+                            f"but saving its trade record failed: {db_error}"
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_persistence_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
+
+            try:
+                await self.telegram.notify_trade_close(
+                    symbol=trade["symbol"],
+                    side=trade["side"],
+                    entry_price=trade["entry_price"],
+                    exit_price=result.price or trade["exit_price"],
+                    pnl=trade["pnl"],
+                    pnl_pct=trade["pnl_pct"],
+                    duration=trade.get("duration", "N/A"),
+                    reasoning=f"Circuit-breaker emergency close: {reason}",
+                )
+            except Exception as notify_error:
+                log.error(
+                    "emergency_close_notification_failed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    error=str(notify_error),
+                )
+
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
         now = time.time()
@@ -664,7 +760,8 @@ class TradingBot:
                 event.breaker_type.value, event.action.value, event.reason,
             )
             if event.action == BreakerAction.CLOSE_ALL:
-                await self.executor.emergency_close_all()
+                results = await self.executor.emergency_close_all()
+                await self._process_emergency_close_results(results, event.reason)
             elif event.action == BreakerAction.TIGHTEN_STOPS:
                 for pos in self.position_manager.open_positions:
                     self.position_manager.update_stop_loss(pos.symbol, pos.entry_price)
