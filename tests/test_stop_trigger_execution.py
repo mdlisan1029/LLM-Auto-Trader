@@ -206,3 +206,106 @@ async def test_bot_does_not_record_or_notify_when_exchange_close_fails() -> None
     bot.symbol_cooldown.on_stop_out.assert_not_called()
     bot.telegram.notify_trade_close.assert_not_awaited()
     bot.position_manager.close_position.assert_not_called()
+
+
+SYMBOL_MARGIN = "SOL/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_margin_force_close_uses_executor_and_records_only_confirmed_trade() -> None:
+    trade = {
+        "symbol": SYMBOL_MARGIN,
+        "side": "short",
+        "entry_price": 150.0,
+        "exit_price": 142.0,
+        "pnl": 8.0,
+        "pnl_pct": 1.6,
+        "duration": "12m",
+    }
+    result = ExecutionResult(
+        success=True,
+        action="close",
+        symbol=SYMBOL_MARGIN,
+        side="short",
+        price=142.0,
+        order_id="margin-close-1",
+        order_status="closed",
+        filled_size=2.0,
+        remaining_size=0.0,
+        trade_record=trade,
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.executor = SimpleNamespace(
+        close_position_for_trigger=AsyncMock(return_value=result)
+    )
+    bot.position_manager = Mock()
+    bot.memory = SimpleNamespace(record_trade=Mock())
+    bot.db = SimpleNamespace(save_trade=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_margin_force_close(SYMBOL_MARGIN, 141.5)
+
+    bot.executor.close_position_for_trigger.assert_awaited_once_with(
+        symbol=SYMBOL_MARGIN,
+        current_price=141.5,
+        reason="margin_buffer_force_close",
+    )
+    bot.position_manager.close_position.assert_not_called()
+    bot.memory.record_trade.assert_called_once_with(trade)
+    bot.db.save_trade.assert_awaited_once_with(trade)
+    bot.telegram.notify_trade_close.assert_awaited_once_with(
+        symbol=SYMBOL_MARGIN,
+        side="short",
+        entry_price=150.0,
+        exit_price=142.0,
+        pnl=8.0,
+        pnl_pct=1.6,
+        duration="12m",
+        reasoning="Margin liquidation-buffer force-close",
+    )
+    bot.telegram.send_circuit_breaker_alert.assert_not_awaited()
+    bot.circuit_breakers._halt_trading.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_partial_margin_force_close_does_not_record_success_and_halts_entries() -> None:
+    result = ExecutionResult(
+        success=False,
+        action="close",
+        symbol=SYMBOL_MARGIN,
+        side="long",
+        order_id="margin-close-partial",
+        order_status="canceled",
+        filled_size=0.4,
+        remaining_size=0.6,
+        error="Partial close fill: 0.4 of 1.0; 0.6 remains open",
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.executor = SimpleNamespace(
+        close_position_for_trigger=AsyncMock(return_value=result)
+    )
+    bot.position_manager = Mock()
+    bot.memory = SimpleNamespace(record_trade=Mock())
+    bot.db = SimpleNamespace(save_trade=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_margin_force_close(SYMBOL_MARGIN, 95.0)
+
+    bot.position_manager.close_position.assert_not_called()
+    bot.memory.record_trade.assert_not_called()
+    bot.db.save_trade.assert_not_awaited()
+    bot.telegram.notify_trade_close.assert_not_awaited()
+    bot.circuit_breakers._halt_trading.assert_called_once_with(600)
+    bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
+    alert_args = bot.telegram.send_circuit_breaker_alert.await_args.args
+    assert alert_args[0] == "margin_force_close_failed"
+    assert alert_args[1] == "HALT_NEW"
+    assert "0.6" in alert_args[2]
