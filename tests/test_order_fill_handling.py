@@ -236,10 +236,17 @@ async def test_two_stage_partial_close_preserves_realized_pnl_and_final_trade_re
     assert not partial.success
     assert final.success
     assert final.trade_record is not None
-    assert final.trade_record["size"] == pytest.approx(0.006)
+    # The final record summarizes the complete position, not just the
+    # remaining 60% that was closed by the last order.
+    assert final.trade_record["size"] == pytest.approx(0.01)
+    assert final.trade_record["notional"] == pytest.approx(1_000.0)
+    # Volume-weighted exit: (0.004 * 99,000 + 0.006 * 98,000) / 0.01.
+    assert final.trade_record["exit_price"] == pytest.approx(98_400.0)
     # Gross PnL: -4 from the first 40% close and -12 from the final 60%;
     # fees: 0.20 entry + 0.04 partial exit + 0.06 final exit.
     assert final.trade_record["pnl"] == pytest.approx(-16.3)
+    # Net PnL uses the original 500 USDT margin, not the 300 USDT remainder.
+    assert final.trade_record["pnl_pct"] == pytest.approx(-3.26)
     assert position_manager.get_position(SYMBOL) is None
 
 
