@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, Mock
-from types import SimpleNamespace
+import types
+import unittest.mock
 
 import pytest
 
@@ -31,8 +31,8 @@ async def test_live_triggered_close_submits_reduce_only_order_and_records_trade(
         fees=0.2,
         reasoning="test position",
     )
-    exchange = Mock()
-    exchange.create_order = AsyncMock(
+    exchange = unittest.mock.Mock()
+    exchange.create_order = unittest.mock.Asyncunittest.mock.Mock(
         return_value={
             "id": "close-order-1",
             "status": "closed",
@@ -83,8 +83,8 @@ async def test_triggered_close_failure_keeps_local_position_open() -> None:
         take_profit=104_000.0,
         reasoning="test position",
     )
-    exchange = Mock()
-    exchange.create_order = AsyncMock(side_effect=RuntimeError("exchange unavailable"))
+    exchange = unittest.mock.Mock()
+    exchange.create_order = unittest.mock.Asyncunittest.mock.Mock(side_effect=RuntimeError("exchange unavailable"))
     executor = TradeExecutor(
         exchange=exchange,
         position_manager=position_manager,
@@ -105,10 +105,10 @@ async def test_triggered_close_failure_keeps_local_position_open() -> None:
 @pytest.mark.asyncio
 async def test_bot_routes_stop_loss_and_take_profit_through_executor() -> None:
     bot = TradingBot.__new__(TradingBot)
-    bot.position_manager = Mock()
+    bot.position_manager = unittest.mock.Mock()
     bot.position_manager.check_stop_losses.return_value = [SYMBOL_SL]
     bot.position_manager.check_take_profits.return_value = [SYMBOL_TP]
-    bot.position_manager.close_position = Mock(
+    bot.position_manager.close_position = unittest.mock.Mock(
         side_effect=AssertionError("Bot must not close positions locally")
     )
 
@@ -132,17 +132,17 @@ async def test_bot_routes_stop_loss_and_take_profit_through_executor() -> None:
             trade_record=trade,
         )
 
-    bot.executor = SimpleNamespace(
-        close_position_for_trigger=AsyncMock(side_effect=close_trigger)
+    bot.executor = types.SimpleNamespace(
+        close_position_for_trigger=unittest.mock.Asyncunittest.mock.Mock(side_effect=close_trigger)
     )
-    bot.memory = SimpleNamespace(record_trade=Mock())
-    bot.db = SimpleNamespace(save_trade=AsyncMock())
-    bot.circuit_breakers = SimpleNamespace(record_loss=Mock())
-    bot.symbol_cooldown = SimpleNamespace(on_stop_out=Mock())
-    bot.settings = SimpleNamespace(
-        afml=SimpleNamespace(enable_all=True, enable_sl_cooldown=True)
+    bot.memory = types.SimpleNamespace(record_trade=unittest.mock.Mock())
+    bot.db = types.SimpleNamespace(save_trade=unittest.mock.Asyncunittest.mock.Mock())
+    bot.circuit_breakers = types.SimpleNamespace(record_loss=unittest.mock.Mock())
+    bot.symbol_cooldown = types.SimpleNamespace(on_stop_out=unittest.mock.Mock())
+    bot.settings = types.SimpleNamespace(
+        afml=types.SimpleNamespace(enable_all=True, enable_sl_cooldown=True)
     )
-    bot.telegram = SimpleNamespace(notify_trade_close=AsyncMock())
+    bot.telegram = types.SimpleNamespace(notify_trade_close=unittest.mock.Asyncunittest.mock.Mock())
 
     await bot._process_exit_triggers(
         {SYMBOL_SL: 97_900.0, SYMBOL_TP: 3_500.0}
@@ -170,14 +170,14 @@ async def test_bot_routes_stop_loss_and_take_profit_through_executor() -> None:
 @pytest.mark.asyncio
 async def test_bot_does_not_record_or_notify_when_exchange_close_fails() -> None:
     bot = TradingBot.__new__(TradingBot)
-    bot.position_manager = Mock()
+    bot.position_manager = unittest.mock.Mock()
     bot.position_manager.check_stop_losses.return_value = [SYMBOL_SL]
     bot.position_manager.check_take_profits.return_value = []
-    bot.position_manager.close_position = Mock(
+    bot.position_manager.close_position = unittest.mock.Mock(
         side_effect=AssertionError("Bot must not close positions locally")
     )
-    bot.executor = SimpleNamespace(
-        close_position_for_trigger=AsyncMock(
+    bot.executor = types.SimpleNamespace(
+        close_position_for_trigger=unittest.mock.Asyncunittest.mock.Mock(
             return_value=ExecutionResult(
                 success=False,
                 action="close",
@@ -187,12 +187,12 @@ async def test_bot_does_not_record_or_notify_when_exchange_close_fails() -> None
             )
         )
     )
-    bot.memory = SimpleNamespace(record_trade=Mock())
-    bot.db = SimpleNamespace(save_trade=AsyncMock())
-    bot.circuit_breakers = SimpleNamespace(record_loss=Mock())
-    bot.symbol_cooldown = SimpleNamespace(on_stop_out=Mock())
-    bot.settings = SimpleNamespace(afml=None)
-    bot.telegram = SimpleNamespace(notify_trade_close=AsyncMock())
+    bot.memory = types.SimpleNamespace(record_trade=unittest.mock.Mock())
+    bot.db = types.SimpleNamespace(save_trade=unittest.mock.Asyncunittest.mock.Mock())
+    bot.circuit_breakers = types.SimpleNamespace(record_loss=unittest.mock.Mock())
+    bot.symbol_cooldown = types.SimpleNamespace(on_stop_out=unittest.mock.Mock())
+    bot.settings = types.SimpleNamespace(afml=None)
+    bot.telegram = types.SimpleNamespace(notify_trade_close=unittest.mock.Asyncunittest.mock.Mock())
 
     await bot._process_exit_triggers({SYMBOL_SL: 97_900.0})
 
