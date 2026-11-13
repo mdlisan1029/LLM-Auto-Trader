@@ -770,7 +770,8 @@ class TradingBot:
                 event.breaker_type.value, event.action.value, event.reason,
             )
             if event.action == BreakerAction.CLOSE_ALL:
-                await self.executor.emergency_close_all()
+                results = await self.executor.emergency_close_all()
+                await self._process_emergency_close_results(results)
             elif event.action == BreakerAction.TIGHTEN_STOPS:
                 for pos in self.position_manager.open_positions:
                     self.position_manager.update_stop_loss(pos.symbol, pos.entry_price)
