@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import pytest
-
-from src.execution.executor import TradeExecutor
-from src.execution.position_manager import PositionManager
-from src.llm.response_parser import ActionType, TradeAction
-from src.risk.risk_manager import ValidationResult
+import src.execution.executor
+import src.execution.position_manager
+import src.llm.response_parser
+import src.risk.risk_manager
 
 
 SYMBOL = "BTC/USDT:USDT"
@@ -52,7 +51,7 @@ class StubExchange:
         return self._fetch_response
 
 
-def _open_position(position_manager: PositionManager) -> None:
+def _open_position(position_manager: src.execution.position_manager.PositionManager) -> None:
     position_manager.open_position(
         symbol=SYMBOL,
         side="long",
@@ -69,7 +68,7 @@ def _open_position(position_manager: PositionManager) -> None:
 
 @pytest.mark.asyncio
 async def test_partial_close_cancels_remainder_and_tracks_only_confirmed_fill() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     terminal_partial = {
         "id": "close-1",
@@ -92,7 +91,7 @@ async def test_partial_close_cancels_remainder_and_tracks_only_confirmed_fill() 
         cancel_response=terminal_partial,
         fetch_response=terminal_partial,
     )
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     result = await executor.close_position_for_trigger(
         symbol=SYMBOL,
@@ -117,7 +116,7 @@ async def test_partial_close_cancels_remainder_and_tracks_only_confirmed_fill() 
 
 @pytest.mark.asyncio
 async def test_unfilled_close_keeps_entire_local_position_open() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     exchange = StubExchange(create_orders=[{
         "id": "close-empty",
@@ -126,7 +125,7 @@ async def test_unfilled_close_keeps_entire_local_position_open() -> None:
         "filled": 0.0,
         "remaining": 0.01,
     }])
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     result = await executor.close_position_for_trigger(
         symbol=SYMBOL,
@@ -146,7 +145,7 @@ async def test_unfilled_close_keeps_entire_local_position_open() -> None:
 
 @pytest.mark.asyncio
 async def test_ambiguous_order_without_terminal_status_is_not_assumed_filled() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     exchange = StubExchange(
         create_orders=[{
@@ -155,7 +154,7 @@ async def test_ambiguous_order_without_terminal_status_is_not_assumed_filled() -
             "filled": 0.01,
         }]
     )
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     result = await executor.close_position_for_trigger(
         symbol=SYMBOL,
@@ -173,7 +172,7 @@ async def test_ambiguous_order_without_terminal_status_is_not_assumed_filled() -
 
 @pytest.mark.asyncio
 async def test_close_response_without_filled_quantity_does_not_use_requested_size() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     exchange = StubExchange(create_orders=[{
         "id": "close-no-fill-field",
@@ -181,7 +180,7 @@ async def test_close_response_without_filled_quantity_does_not_use_requested_siz
         "amount": 0.01,
         "remaining": 0.01,
     }])
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     result = await executor.close_position_for_trigger(
         symbol=SYMBOL,
@@ -198,7 +197,7 @@ async def test_close_response_without_filled_quantity_does_not_use_requested_siz
 
 @pytest.mark.asyncio
 async def test_two_stage_partial_close_preserves_realized_pnl_and_final_trade_record() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     exchange = StubExchange(create_orders=[
         {
@@ -220,7 +219,7 @@ async def test_two_stage_partial_close_preserves_realized_pnl_and_final_trade_re
             "fee": {"cost": 0.06},
         },
     ])
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     partial = await executor.close_position_for_trigger(
         symbol=SYMBOL,
@@ -245,8 +244,8 @@ async def test_two_stage_partial_close_preserves_realized_pnl_and_final_trade_re
 
 @pytest.mark.asyncio
 async def test_entry_with_zero_confirmed_fill_does_not_open_local_position() -> None:
-    action = TradeAction(
-        action=ActionType.OPEN_LONG,
+    action = src.llm.response_parser.TradeAction(
+        action=src.llm.response_parser.ActionType.OPEN_LONG,
         symbol=SYMBOL,
         size_pct=10,
         leverage=2,
@@ -254,8 +253,8 @@ async def test_entry_with_zero_confirmed_fill_does_not_open_local_position() -> 
         take_profit=104_000.0,
         reasoning="test entry order",
     )
-    validation = ValidationResult(approved=True, action=action, adjusted_size_pct=10)
-    position_manager = PositionManager()
+    validation = src.risk.risk_manager.ValidationResult(approved=True, action=action, adjusted_size_pct=10)
+    position_manager = src.execution.position_manager.PositionManager()
     exchange = StubExchange(create_orders=[{
         "id": "entry-empty",
         "status": "canceled",
@@ -263,7 +262,7 @@ async def test_entry_with_zero_confirmed_fill_does_not_open_local_position() -> 
         "filled": 0.0,
         "remaining": 0.001,
     }])
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     result = await executor.execute(
         action=action,
@@ -279,8 +278,8 @@ async def test_entry_with_zero_confirmed_fill_does_not_open_local_position() -> 
 
 @pytest.mark.asyncio
 async def test_partial_entry_tracks_only_the_actual_filled_size() -> None:
-    action = TradeAction(
-        action=ActionType.OPEN_LONG,
+    action = src.llm.response_parser.TradeAction(
+        action=src.llm.response_parser.ActionType.OPEN_LONG,
         symbol=SYMBOL,
         size_pct=10,
         leverage=2,
@@ -288,8 +287,8 @@ async def test_partial_entry_tracks_only_the_actual_filled_size() -> None:
         take_profit=104_000.0,
         reasoning="test partial entry",
     )
-    validation = ValidationResult(approved=True, action=action, adjusted_size_pct=10)
-    position_manager = PositionManager()
+    validation = src.risk.risk_manager.ValidationResult(approved=True, action=action, adjusted_size_pct=10)
+    position_manager = src.execution.position_manager.PositionManager()
     exchange = StubExchange(create_orders=[{
         "id": "entry-partial",
         "status": "canceled",
@@ -298,7 +297,7 @@ async def test_partial_entry_tracks_only_the_actual_filled_size() -> None:
         "remaining": 0.0005,
         "average": 100_100.0,
     }])
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     result = await executor.execute(
         action=action,
@@ -318,7 +317,7 @@ async def test_partial_entry_tracks_only_the_actual_filled_size() -> None:
 
 @pytest.mark.asyncio
 async def test_partial_reduce_updates_only_confirmed_quantity() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     exchange = StubExchange(
         create_orders=[{
@@ -331,9 +330,9 @@ async def test_partial_reduce_updates_only_confirmed_quantity() -> None:
         }],
         precision={"amount": 0.001},
     )
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
-    action = TradeAction(
-        action=ActionType.REDUCE_POSITION,
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
+    action = src.llm.response_parser.TradeAction(
+        action=src.llm.response_parser.ActionType.REDUCE_POSITION,
         symbol=SYMBOL,
         size_pct=10,
         reasoning="test reduce",
@@ -352,7 +351,7 @@ async def test_partial_reduce_updates_only_confirmed_quantity() -> None:
 
 @pytest.mark.asyncio
 async def test_partial_emergency_close_keeps_unfilled_remainder_tracked() -> None:
-    position_manager = PositionManager()
+    position_manager = src.execution.position_manager.PositionManager()
     _open_position(position_manager)
     exchange = StubExchange(create_orders=[{
         "id": "emergency-partial",
@@ -362,7 +361,7 @@ async def test_partial_emergency_close_keeps_unfilled_remainder_tracked() -> Non
         "remaining": 0.006,
         "average": 97_000.0,
     }])
-    executor = TradeExecutor(exchange, position_manager, paper_mode=False)
+    executor = src.execution.executor.TradeExecutor(exchange, position_manager, paper_mode=False)
 
     results = await executor.emergency_close_all()
 
