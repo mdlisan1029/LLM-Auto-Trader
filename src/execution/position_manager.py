@@ -213,11 +213,12 @@ class PositionManager:
             log.warning("close_position_not_found", symbol=symbol)
             return {}
 
-        # Calculate final PnL
+        # Include PnL realized by earlier partial fills.
         if pos.side == "long":
             pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.notional
         else:
             pnl = (pos.entry_price - exit_price) / pos.entry_price * pos.notional
+        pnl += pos.realized_pnl
 
         total_fees = pos.fees_paid + fees
         net_pnl = pnl - total_fees
@@ -258,6 +259,53 @@ class PositionManager:
             **{k: v for k, v in trade.items() if k != "reasoning"},
         )
         return trade
+
+    def reduce_position(
+        self,
+        symbol: str,
+        reduced_size: float,
+        exit_price: float,
+        fees: float = 0,
+    ) -> float:
+        """Apply an exchange-confirmed partial close and return remaining size.
+
+        Realized PnL and fees are retained on the open position so the final
+        close record includes every confirmed partial execution.
+        """
+        pos = self._positions.get(symbol)
+        if pos is None or reduced_size <= 0 or pos.size <= 0:
+            return pos.size if pos is not None else 0.0
+
+        actual_size = min(float(reduced_size), pos.size)
+        fraction = actual_size / pos.size
+        closed_notional = pos.notional * fraction
+
+        if pos.entry_price > 0:
+            if pos.side == "long":
+                realized = (exit_price - pos.entry_price) / pos.entry_price * closed_notional
+            else:
+                realized = (pos.entry_price - exit_price) / pos.entry_price * closed_notional
+            pos.realized_pnl += realized
+
+        pos.size = max(0.0, pos.size - actual_size)
+        pos.notional = max(0.0, pos.notional - closed_notional)
+        pos.fees_paid += max(0.0, fees)
+
+        # Avoid leaving a floating-point dust position after a full fill.
+        tolerance = max(actual_size * 1e-10, 1e-12)
+        if pos.size <= tolerance:
+            pos.size = 0.0
+            pos.notional = 0.0
+
+        log.info(
+            "position_partially_reduced",
+            symbol=symbol,
+            reduced_size=actual_size,
+            remaining_size=pos.size,
+            realized_pnl=pos.realized_pnl,
+            fees_paid=pos.fees_paid,
+        )
+        return pos.size
 
     def update_prices(self, prices: dict[str, float]) -> None:
         """Update all position prices from latest market data."""
