@@ -356,6 +356,146 @@ class TradingBot:
         finally:
             await self.shutdown()
 
+    async def _halt_on_trigger_exit_failure(self, symbol: str, reason: str, result, detail: str) -> None:
+        """Halt new entries and alert when an SL/TP close is not fully confirmed."""
+        self.circuit_breakers._halt_trading(600)
+        try:
+            await self.telegram.send_circuit_breaker_alert(
+                "protective_exit_close_failed",
+                "HALT_NEW",
+                (
+                    f"{reason} close for {symbol} was not fully confirmed: {detail}. "
+                    f"Order: {getattr(result, 'order_id', '') or 'unknown'}; "
+                    f"status: {getattr(result, 'order_status', '') or 'unknown'}; "
+                    f"filled: {getattr(result, 'filled_size', 0)}; "
+                    f"remaining reported: {getattr(result, 'remaining_size', 0)}. "
+                    "New entries halted for 10 minutes; reconcile exchange exposure."
+                ),
+            )
+        except Exception as alert_error:
+            log.error(
+                "protective_exit_failure_alert_failed",
+                symbol=symbol,
+                reason=reason,
+                error=str(alert_error),
+            )
+
+    async def _process_exit_triggers(self, ws_prices: dict[str, float]) -> None:
+        """Close positions whose local SL/TP trigger has fired.
+
+        The exchange executor is the only component allowed to close the
+        position. Local state and trade history are updated only after the
+        executor confirms a successful close.
+        """
+        sl_hits = self.position_manager.check_stop_losses(ws_prices)
+        for symbol in sl_hits:
+            price = ws_prices.get(symbol)
+            if price is None or price <= 0:
+                log.error("stop_loss_close_skipped_missing_price", symbol=symbol)
+                continue
+
+            result = await self.executor.close_position_for_trigger(
+                symbol=symbol,
+                current_price=price,
+                reason="stop_loss",
+            )
+            if not result.success:
+                log.error(
+                    "stop_loss_exchange_close_failed",
+                    symbol=symbol,
+                    error=result.error,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "stop_loss", result, result.error or "close not confirmed",
+                )
+                continue
+
+            trade = result.trade_record
+            if not trade:
+                detail = "exchange close was reported successful but no trade record was returned"
+                log.error(
+                    "stop_loss_close_missing_trade_record",
+                    symbol=symbol,
+                    order_id=result.order_id,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "stop_loss", result, detail,
+                )
+                continue
+
+            exit_price = result.price or price
+            self.memory.record_trade(trade)
+            await self.db.save_trade(trade)
+            self.circuit_breakers.record_loss(trade.get("pnl_pct", 0) / 100)
+
+            # Phase 3 §3B.9 — record SL for cooldown.
+            afml_cfg = getattr(self.settings, "afml", None)
+            if (afml_cfg is not None
+                    and getattr(afml_cfg, "enable_all", True)
+                    and getattr(afml_cfg, "enable_sl_cooldown", True)):
+                self.symbol_cooldown.on_stop_out(symbol, now=time.time())
+
+            await self.telegram.notify_trade_close(
+                symbol=symbol,
+                side=trade["side"],
+                entry_price=trade["entry_price"],
+                exit_price=exit_price,
+                pnl=trade["pnl"],
+                pnl_pct=trade["pnl_pct"],
+                duration=trade.get("duration", "N/A"),
+                reasoning="Stop-loss hit",
+            )
+
+        tp_hits = self.position_manager.check_take_profits(ws_prices)
+        for symbol in tp_hits:
+            price = ws_prices.get(symbol)
+            if price is None or price <= 0:
+                log.error("take_profit_close_skipped_missing_price", symbol=symbol)
+                continue
+
+            result = await self.executor.close_position_for_trigger(
+                symbol=symbol,
+                current_price=price,
+                reason="take_profit",
+            )
+            if not result.success:
+                log.error(
+                    "take_profit_exchange_close_failed",
+                    symbol=symbol,
+                    error=result.error,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "take_profit", result, result.error or "close not confirmed",
+                )
+                continue
+
+            trade = result.trade_record
+            if not trade:
+                detail = "exchange close was reported successful but no trade record was returned"
+                log.error(
+                    "take_profit_close_missing_trade_record",
+                    symbol=symbol,
+                    order_id=result.order_id,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "take_profit", result, detail,
+                )
+                continue
+
+            exit_price = result.price or price
+            self.memory.record_trade(trade)
+            await self.db.save_trade(trade)
+            await self.telegram.notify_trade_close(
+                symbol=symbol,
+                side=trade["side"],
+                entry_price=trade["entry_price"],
+                exit_price=exit_price,
+                pnl=trade["pnl"],
+                pnl_pct=trade["pnl_pct"],
+                duration=trade.get("duration", "N/A"),
+                reasoning="Take-profit hit",
+            )
+
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
         now = time.time()
@@ -377,43 +517,8 @@ class TradingBot:
                 ws_prices[sym] = state.current_price
         self.position_manager.update_prices(ws_prices)
 
-        # --- 3. Check SL/TP hits ---
-        sl_hits = self.position_manager.check_stop_losses(ws_prices)
-        for sym in sl_hits:
-            price = ws_prices.get(sym, 0)
-            trade = self.position_manager.close_position(sym, price, 0)
-            if trade:
-                self.memory.record_trade(trade)
-                await self.db.save_trade(trade)
-                self.circuit_breakers.record_loss(trade.get("pnl_pct", 0) / 100)
-                # Phase 3 §3B.9 — record SL for cooldown
-                afml_cfg = getattr(self.settings, "afml", None)
-                if (afml_cfg is not None
-                        and getattr(afml_cfg, "enable_all", True)
-                        and getattr(afml_cfg, "enable_sl_cooldown", True)):
-                    self.symbol_cooldown.on_stop_out(sym, now=time.time())
-                await self.telegram.notify_trade_close(
-                    symbol=sym, side=trade["side"],
-                    entry_price=trade["entry_price"], exit_price=price,
-                    pnl=trade["pnl"], pnl_pct=trade["pnl_pct"],
-                    duration=trade.get("duration", "N/A"),
-                    reasoning="Stop-loss hit",
-                )
-
-        tp_hits = self.position_manager.check_take_profits(ws_prices)
-        for sym in tp_hits:
-            price = ws_prices.get(sym, 0)
-            trade = self.position_manager.close_position(sym, price, 0)
-            if trade:
-                self.memory.record_trade(trade)
-                await self.db.save_trade(trade)
-                await self.telegram.notify_trade_close(
-                    symbol=sym, side=trade["side"],
-                    entry_price=trade["entry_price"], exit_price=price,
-                    pnl=trade["pnl"], pnl_pct=trade["pnl_pct"],
-                    duration=trade.get("duration", "N/A"),
-                    reasoning="Take-profit hit",
-                )
+        # --- 3. Check SL/TP hits through the exchange executor ---
+        await self._process_exit_triggers(ws_prices)
 
         # --- 4. Circuit breaker checks ---
         balance = await self.market.fetch_balance()

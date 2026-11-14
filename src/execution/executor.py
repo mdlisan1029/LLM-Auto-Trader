@@ -30,6 +30,7 @@ class ExecutionResult:
     fees: float = 0
     order_id: str = ""
     error: str = ""
+    trade_record: dict | None = None
 
 
 class TradeExecutor:
@@ -209,6 +210,49 @@ class TradeExecutor:
             except ccxt.ExchangeError as e:
                 raise OrderError(f"Exchange error: {e}") from e
 
+    async def close_position_for_trigger(
+        self,
+        symbol: str,
+        current_price: float,
+        reason: str,
+    ) -> ExecutionResult:
+        """Close an SL/TP-triggered position through the exchange executor.
+
+        Unlike the old local-only trigger handling, this method submits a
+        reduce-only market order in live mode. The position manager is updated
+        by _close_position only after the exchange order call succeeds.
+        """
+        action = TradeAction(
+            action=ActionType.CLOSE,
+            symbol=symbol,
+            reasoning=f"Automatic {reason.replace('_', ' ')} close",
+        )
+        try:
+            result = await self._close_position(action, current_price)
+            if not result.success:
+                log.error(
+                    "triggered_position_close_failed",
+                    symbol=symbol,
+                    reason=reason,
+                    error=result.error,
+                )
+            return result
+        except Exception as e:
+            log.error(
+                "triggered_position_close_failed",
+                symbol=symbol,
+                reason=reason,
+                error=str(e),
+                exc_info=True,
+            )
+            return ExecutionResult(
+                success=False,
+                action="close",
+                symbol=symbol,
+                side="",
+                error=str(e),
+            )
+
     async def _close_position(
         self, action: TradeAction, current_price: float
     ) -> ExecutionResult:
@@ -224,11 +268,12 @@ class TradeExecutor:
 
         if self._paper_mode:
             fees = pos.notional * self._taker_fee
-            self._pm.close_position(action.symbol, current_price, fees)
+            trade_record = self._pm.close_position(action.symbol, current_price, fees)
             return ExecutionResult(
                 success=True, action="close", symbol=action.symbol,
                 side=pos.side, size=pos.size, price=current_price,
                 fees=fees, order_id=f"paper_{int(time.time())}",
+                trade_record=trade_record or None,
             )
         else:
             try:
@@ -238,11 +283,12 @@ class TradeExecutor:
                 )
                 fill_price = order.get("average", current_price) or current_price
                 fees = order.get("fee", {}).get("cost", 0) or 0
-                self._pm.close_position(action.symbol, fill_price, fees)
+                trade_record = self._pm.close_position(action.symbol, fill_price, fees)
                 return ExecutionResult(
                     success=True, action="close", symbol=action.symbol,
                     side=pos.side, size=pos.size, price=fill_price,
                     fees=fees, order_id=order.get("id", ""),
+                    trade_record=trade_record or None,
                 )
             except ccxt.ExchangeError as e:
                 raise OrderError(f"Close failed: {e}") from e
