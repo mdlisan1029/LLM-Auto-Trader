@@ -35,6 +35,9 @@ class ExecutionResult:
     order_status: str = ""
     filled_size: float = 0
     remaining_size: float = 0
+    # True when the exchange may have accepted the order but its final state
+    # could not be confirmed. Remaining size is then a conservative upper bound.
+    state_uncertain: bool = False
 
 
 class TradeExecutor:
@@ -187,6 +190,47 @@ class TradeExecutor:
         )
         return fee_value if fee_value is not None else max(0.0, fallback_fee)
 
+    def _unconfirmed_order_result(
+        self,
+        *,
+        action: str,
+        symbol: str,
+        side: str,
+        requested_size: float,
+        error: Exception,
+        order: dict | None = None,
+    ) -> ExecutionResult:
+        """Keep uncertain exchange outcomes visible and block unsafe assumptions."""
+        order = order if isinstance(order, dict) else {}
+        order_id = str(order.get("id") or "")
+        status = str(order.get("status") or "unknown").lower()
+        reported_fill = self._optional_nonnegative_float(order.get("filled"))
+        fill_note = (
+            f" Exchange's non-terminal response reported filled={reported_fill},"
+            " which is not treated as a confirmed fill."
+            if reported_fill is not None else ""
+        )
+        return ExecutionResult(
+            success=False,
+            action=action,
+            symbol=symbol,
+            side=side,
+            size=requested_size,
+            order_id=order_id,
+            order_status=status,
+            filled_size=0.0,
+            # This is the maximum quantity that could still be exposed, not
+            # a claim that the full amount definitely remains open.
+            remaining_size=requested_size,
+            state_uncertain=True,
+            error=(
+                f"Exchange order outcome is unknown (status={status}). No fill "
+                f"was applied locally; up to {requested_size} may remain exposed. "
+                f"Reconcile the exchange order/position before trading again. "
+                f"Cause: {error}.{fill_note}"
+            ),
+        )
+
     async def execute(
         self,
         action: TradeAction,
@@ -310,20 +354,32 @@ class TradeExecutor:
                         error=str(lev_err),
                     )
 
-                # Place order
-                if action.order_type == "limit" and action.entry_price:
-                    price = round_price(action.entry_price, tick_size)
-                    order = await self._exchange.create_order(
-                        action.symbol, "limit", ccxt_side, contracts, price,
-                    )
-                else:
-                    order = await self._exchange.create_order(
-                        action.symbol, "market", ccxt_side, contracts,
-                    )
+                # Place and resolve the order. A timeout or an ambiguous
+                # response can happen after the exchange accepted the request.
+                order: dict | None = None
+                try:
+                    if action.order_type == "limit" and action.entry_price:
+                        price = round_price(action.entry_price, tick_size)
+                        order = await self._exchange.create_order(
+                            action.symbol, "limit", ccxt_side, contracts, price,
+                        )
+                    else:
+                        order = await self._exchange.create_order(
+                            action.symbol, "market", ccxt_side, contracts,
+                        )
 
-                order, fill_size, fully_filled = await self._resolve_order_fill(
-                    order, action.symbol, contracts,
-                )
+                    order, fill_size, fully_filled = await self._resolve_order_fill(
+                        order, action.symbol, contracts,
+                    )
+                except Exception as order_error:
+                    return self._unconfirmed_order_result(
+                        action=action.action.value,
+                        symbol=action.symbol,
+                        side=side,
+                        requested_size=contracts,
+                        error=order_error,
+                        order=order,
+                    )
                 order_id = str(order.get("id") or "")
                 order_status = str(order.get("status") or "").lower()
                 if fill_size <= 0:
@@ -443,6 +499,7 @@ class TradeExecutor:
                 trade_record=trade_record or None,
             )
         else:
+            order: dict | None = None
             try:
                 order = await self._exchange.create_order(
                     action.symbol, "market", ccxt_side, pos.size,
@@ -499,8 +556,15 @@ class TradeExecutor:
                         f"{remaining_size} remains open"
                     ),
                 )
-            except ccxt.ExchangeError as e:
-                raise OrderError(f"Close failed: {e}") from e
+            except Exception as e:
+                return self._unconfirmed_order_result(
+                    action="close",
+                    symbol=action.symbol,
+                    side=pos.side,
+                    requested_size=pos.size,
+                    error=e,
+                    order=order,
+                )
 
     async def _reduce_position(
         self, action: TradeAction, current_price: float
@@ -533,13 +597,24 @@ class TradeExecutor:
                     success=False, action="reduce", symbol=action.symbol,
                     side=pos.side, error="Reduce size is too small after rounding",
                 )
-            order = await self._exchange.create_order(
-                action.symbol, "market", ccxt_side, requested_size,
-                params={"reduceOnly": True},
-            )
-            order, filled_size, fully_filled = await self._resolve_order_fill(
-                order, action.symbol, requested_size,
-            )
+            order: dict | None = None
+            try:
+                order = await self._exchange.create_order(
+                    action.symbol, "market", ccxt_side, requested_size,
+                    params={"reduceOnly": True},
+                )
+                order, filled_size, fully_filled = await self._resolve_order_fill(
+                    order, action.symbol, requested_size,
+                )
+            except Exception as order_error:
+                return self._unconfirmed_order_result(
+                    action="reduce",
+                    symbol=action.symbol,
+                    side=pos.side,
+                    requested_size=requested_size,
+                    error=order_error,
+                    order=order,
+                )
             order_id = str(order.get("id") or "")
             order_status = str(order.get("status") or "").lower()
             if filled_size <= 0:
@@ -622,6 +697,7 @@ class TradeExecutor:
         """Emergency close: update local positions only for confirmed fills."""
         results: list[ExecutionResult] = []
         for pos in self._pm.open_positions:
+            order: dict | None = None
             try:
                 if self._paper_mode:
                     trade_record = self._pm.close_position(pos.symbol, pos.mark_price, 0)
@@ -682,8 +758,12 @@ class TradeExecutor:
                 log.critical("emergency_close", symbol=pos.symbol, side=pos.side)
             except Exception as e:
                 log.error("emergency_close_failed", symbol=pos.symbol, error=str(e))
-                results.append(ExecutionResult(
-                    success=False, action="emergency_close",
-                    symbol=pos.symbol, side=pos.side, error=str(e),
+                results.append(self._unconfirmed_order_result(
+                    action="emergency_close",
+                    symbol=pos.symbol,
+                    side=pos.side,
+                    requested_size=pos.size,
+                    error=e,
+                    order=order,
                 ))
         return results
