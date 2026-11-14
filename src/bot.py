@@ -560,6 +560,119 @@ class TradingBot:
             reasoning="Margin liquidation-buffer force-close",
         )
 
+    async def _process_emergency_close_results(self, results, reason: str) -> None:
+        """Persist and report only fully confirmed circuit-breaker closes."""
+        for result in results:
+            trade = result.trade_record
+            if not result.success or not trade:
+                error = result.error or (
+                    "Executor reported a close without a completed trade record"
+                    if result.success else
+                    "Emergency close was not fully confirmed"
+                )
+                log.critical(
+                    "circuit_breaker_emergency_close_incomplete",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    order_status=result.order_status,
+                    filled_size=result.filled_size,
+                    remaining_size=result.remaining_size,
+                    error=error,
+                    breaker_reason=reason,
+                )
+                # Failed/partial close leaves exposure open; prevent new risk.
+                self.circuit_breakers._halt_trading(3600)
+                remaining_note = (
+                    f"up to {result.remaining_size} may remain exposed; "
+                    "actual exchange exposure is unknown"
+                    if getattr(result, "state_uncertain", False)
+                    else f"remaining open: {result.remaining_size}"
+                )
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_incomplete",
+                        "HALT_NEW",
+                        (
+                            f"Circuit-breaker close for {result.symbol} was not "
+                            f"fully confirmed/accounted: {error}. "
+                            f"Confirmed filled: {result.filled_size}; "
+                            f"{remaining_note}. Trigger: {reason}"
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_failure_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
+                continue
+
+            # Attempt each reporting destination independently. A failure in
+            # one destination must not suppress the others or later results.
+            reporting_errors: list[str] = []
+            try:
+                self.memory.record_trade(trade)
+            except Exception as memory_error:
+                reporting_errors.append(f"memory: {memory_error}")
+                log.critical(
+                    "emergency_close_memory_record_failed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    error=str(memory_error),
+                )
+
+            try:
+                await self.db.save_trade(trade)
+            except Exception as db_error:
+                reporting_errors.append(f"database: {db_error}")
+                log.critical(
+                    "emergency_close_trade_persistence_failed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    error=str(db_error),
+                )
+
+            try:
+                await self.telegram.notify_trade_close(
+                    symbol=result.symbol,
+                    side=trade.get("side", result.side),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=result.price or trade.get("exit_price", 0),
+                    pnl=trade.get("pnl", 0),
+                    pnl_pct=trade.get("pnl_pct", 0),
+                    duration=trade.get("duration", "N/A"),
+                    reasoning=f"Circuit-breaker emergency close: {reason}",
+                )
+            except Exception as notify_error:
+                reporting_errors.append(f"telegram: {notify_error}")
+                log.error(
+                    "emergency_close_notification_failed",
+                    symbol=result.symbol,
+                    order_id=result.order_id,
+                    error=str(notify_error),
+                )
+
+            if reporting_errors:
+                # Execution happened, but incomplete accounting/reporting
+                # still requires a halt and an explicit operator alert.
+                self.circuit_breakers._halt_trading(3600)
+                try:
+                    await self.telegram.send_circuit_breaker_alert(
+                        "emergency_close_reporting_failed",
+                        "HALT_NEW",
+                        (
+                            f"Exchange confirmed emergency close for {result.symbol}, "
+                            f"but post-close reporting failed: "
+                            f"{'; '.join(reporting_errors)}. Trigger: {reason}"
+                        ),
+                    )
+                except Exception as alert_error:
+                    log.error(
+                        "emergency_close_reporting_alert_failed",
+                        symbol=result.symbol,
+                        error=str(alert_error),
+                    )
+
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
         now = time.time()
@@ -712,7 +825,8 @@ class TradingBot:
                 event.breaker_type.value, event.action.value, event.reason,
             )
             if event.action == BreakerAction.CLOSE_ALL:
-                await self.executor.emergency_close_all()
+                results = await self.executor.emergency_close_all()
+                await self._process_emergency_close_results(results, event.reason)
             elif event.action == BreakerAction.TIGHTEN_STOPS:
                 for pos in self.position_manager.open_positions:
                     self.position_manager.update_stop_loss(pos.symbol, pos.entry_price)
