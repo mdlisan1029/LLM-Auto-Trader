@@ -141,12 +141,18 @@ async def test_bot_routes_stop_loss_and_take_profit_through_executor() -> None:
     )
     bot.memory = SimpleNamespace(record_trade=Mock())
     bot.db = SimpleNamespace(save_trade=AsyncMock())
-    bot.circuit_breakers = SimpleNamespace(record_loss=Mock())
+    bot.circuit_breakers = SimpleNamespace(
+        record_loss=Mock(),
+        _halt_trading=Mock(),
+    )
     bot.symbol_cooldown = SimpleNamespace(on_stop_out=Mock())
     bot.settings = SimpleNamespace(
         afml=SimpleNamespace(enable_all=True, enable_sl_cooldown=True)
     )
-    bot.telegram = SimpleNamespace(notify_trade_close=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
 
     await bot._process_exit_triggers(
         {SYMBOL_SL: 97_900.0, SYMBOL_TP: 3_500.0}
@@ -193,10 +199,16 @@ async def test_bot_does_not_record_or_notify_when_exchange_close_fails() -> None
     )
     bot.memory = SimpleNamespace(record_trade=Mock())
     bot.db = SimpleNamespace(save_trade=AsyncMock())
-    bot.circuit_breakers = SimpleNamespace(record_loss=Mock())
+    bot.circuit_breakers = SimpleNamespace(
+        record_loss=Mock(),
+        _halt_trading=Mock(),
+    )
     bot.symbol_cooldown = SimpleNamespace(on_stop_out=Mock())
     bot.settings = SimpleNamespace(afml=None)
-    bot.telegram = SimpleNamespace(notify_trade_close=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
 
     await bot._process_exit_triggers({SYMBOL_SL: 97_900.0})
 
@@ -206,3 +218,7 @@ async def test_bot_does_not_record_or_notify_when_exchange_close_fails() -> None
     bot.symbol_cooldown.on_stop_out.assert_not_called()
     bot.telegram.notify_trade_close.assert_not_awaited()
     bot.position_manager.close_position.assert_not_called()
+    bot.circuit_breakers._halt_trading.assert_called_once_with(600)
+    bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
+    alert = bot.telegram.send_circuit_breaker_alert.await_args.args
+    assert alert[0] == "protective_exit_close_failed"
