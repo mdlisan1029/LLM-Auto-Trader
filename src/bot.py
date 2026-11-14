@@ -356,6 +356,36 @@ class TradingBot:
         finally:
             await self.shutdown()
 
+    async def _halt_on_trigger_exit_failure(self, symbol: str, reason: str, result, detail: str) -> None:
+        """Halt new entries and alert when an SL/TP close is not fully confirmed."""
+        self.circuit_breakers._halt_trading(600)
+        remaining_note = (
+            f"up to {getattr(result, 'remaining_size', 0)} may remain exposed; "
+            "actual exchange exposure is unknown"
+            if getattr(result, "state_uncertain", False)
+            else f"remaining open: {getattr(result, 'remaining_size', 0)}"
+        )
+        try:
+            await self.telegram.send_circuit_breaker_alert(
+                "protective_exit_close_failed",
+                "HALT_NEW",
+                (
+                    f"{reason} close for {symbol} was not fully confirmed: {detail}. "
+                    f"Order: {getattr(result, 'order_id', '') or 'unknown'}; "
+                    f"status: {getattr(result, 'order_status', '') or 'unknown'}; "
+                    f"confirmed filled: {getattr(result, 'filled_size', 0)}; "
+                    f"{remaining_note}. New entries halted for 10 minutes; "
+                    "reconcile exchange exposure."
+                ),
+            )
+        except Exception as alert_error:
+            log.error(
+                "protective_exit_failure_alert_failed",
+                symbol=symbol,
+                reason=reason,
+                error=str(alert_error),
+            )
+
     async def _process_exit_triggers(self, ws_prices: dict[str, float]) -> None:
         """Close positions whose local SL/TP trigger has fired.
 
@@ -381,14 +411,21 @@ class TradingBot:
                     symbol=symbol,
                     error=result.error,
                 )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "stop_loss", result, result.error or "close not confirmed",
+                )
                 continue
 
             trade = result.trade_record
             if not trade:
+                detail = "exchange close was reported successful but no trade record was returned"
                 log.error(
                     "stop_loss_close_missing_trade_record",
                     symbol=symbol,
                     order_id=result.order_id,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "stop_loss", result, detail,
                 )
                 continue
 
@@ -433,14 +470,21 @@ class TradingBot:
                     symbol=symbol,
                     error=result.error,
                 )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "take_profit", result, result.error or "close not confirmed",
+                )
                 continue
 
             trade = result.trade_record
             if not trade:
+                detail = "exchange close was reported successful but no trade record was returned"
                 log.error(
                     "take_profit_close_missing_trade_record",
                     symbol=symbol,
                     order_id=result.order_id,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "take_profit", result, detail,
                 )
                 continue
 
@@ -778,6 +822,31 @@ class TradingBot:
             )
             max_holding = float(getattr(afml_cfg, "max_holding_s", 259_200)) if afml_on else None
 
+    async def _halt_on_uncertain_execution(self, result) -> None:
+        """Prevent further entries when an exchange order's outcome is unknown."""
+        self.circuit_breakers._halt_trading(3600)
+        try:
+            await self.telegram.send_circuit_breaker_alert(
+                "exchange_order_state_unknown",
+                "HALT_NEW",
+                (
+                    f"Exchange order state is unknown for {result.symbol}. "
+                    f"Order: {result.order_id or 'unknown'}; "
+                    f"status: {result.order_status or 'unknown'}; "
+                    f"confirmed filled: {result.filled_size}; "
+                    f"up to {result.remaining_size} may remain exposed. "
+                    f"Details: {result.error} New entries halted for one hour; "
+                    "reconcile exchange orders and positions before resuming."
+                ),
+            )
+        except Exception as alert_error:
+            log.error(
+                "unknown_order_state_alert_failed",
+                symbol=result.symbol,
+                order_id=result.order_id,
+                error=str(alert_error),
+            )
+
             for action, validation in zip(response.actions, validations):
                 if action.action == ActionType.HOLD:
                     continue
@@ -790,6 +859,12 @@ class TradingBot:
                     confidence=llm_confidence,
                     max_holding_s=max_holding,
                 )
+
+                if result.state_uncertain:
+                    await self._halt_on_uncertain_execution(result)
+                    # Do not submit later actions from this LLM response while
+                    # an earlier exchange order may still be live.
+                    break
 
                 if result.success and action.action in (
                     ActionType.OPEN_LONG, ActionType.OPEN_SHORT
