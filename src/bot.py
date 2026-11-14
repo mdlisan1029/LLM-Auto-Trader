@@ -718,6 +718,31 @@ class TradingBot:
             await retention.run_cleanup()
             self._last_retention_cleanup = now
 
+    async def _halt_on_uncertain_execution(self, result) -> None:
+        """Prevent further entries when an exchange order's outcome is unknown."""
+        self.circuit_breakers._halt_trading(3600)
+        try:
+            await self.telegram.send_circuit_breaker_alert(
+                "exchange_order_state_unknown",
+                "HALT_NEW",
+                (
+                    f"Exchange order state is unknown for {result.symbol}. "
+                    f"Order: {result.order_id or 'unknown'}; "
+                    f"status: {result.order_status or 'unknown'}; "
+                    f"confirmed filled: {result.filled_size}; "
+                    f"up to {result.remaining_size} may remain exposed. "
+                    f"Details: {result.error} New entries halted for one hour; "
+                    "reconcile exchange orders and positions before resuming."
+                ),
+            )
+        except Exception as alert_error:
+            log.error(
+                "unknown_order_state_alert_failed",
+                symbol=result.symbol,
+                order_id=result.order_id,
+                error=str(alert_error),
+            )
+
     async def _run_llm_analysis(self, equity: float) -> None:
         """Run a full LLM analysis cycle."""
         now = time.time()
@@ -828,6 +853,12 @@ class TradingBot:
                     confidence=llm_confidence,
                     max_holding_s=max_holding,
                 )
+
+                if result.state_uncertain:
+                    await self._halt_on_uncertain_execution(result)
+                    # Do not submit later actions from this LLM response while
+                    # an earlier exchange order may still be live.
+                    break
 
                 if result.success and action.action in (
                     ActionType.OPEN_LONG, ActionType.OPEN_SHORT

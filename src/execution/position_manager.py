@@ -38,6 +38,9 @@ class Position:
 
     # Partial close tracking
     original_size: float = 0
+    original_notional: float = 0
+    realized_close_size: float = 0
+    realized_exit_value: float = 0
     partial_tp_taken: bool = False
 
     # Phase 1 §3.5 — triple-barrier config (set at open; consumed at close)
@@ -151,6 +154,7 @@ class PositionManager:
                     unrealized_pnl=ep.get("unrealized_pnl", 0),
                 )
                 pos.original_size = pos.size
+                pos.original_notional = pos.notional
                 pos.highest_price = pos.mark_price
                 pos.lowest_price = pos.mark_price
                 self._positions[sym] = pos
@@ -194,6 +198,7 @@ class PositionManager:
             highest_price=entry_price,
             lowest_price=entry_price,
             original_size=size,
+            original_notional=notional,
             llm_reasoning=reasoning,
             pt_pct=pt_pct,
             sl_pct=sl_pct,
@@ -213,23 +218,39 @@ class PositionManager:
             log.warning("close_position_not_found", symbol=symbol)
             return {}
 
-        # Calculate final PnL
+        # Include PnL realized by earlier partial fills.
         if pos.side == "long":
             pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.notional
         else:
             pnl = (pos.entry_price - exit_price) / pos.entry_price * pos.notional
+        pnl += pos.realized_pnl
+
+        # A completed trade record describes the whole position, not only the
+        # final remainder. Preserve initial exposure for size/notional and
+        # calculate one volume-weighted exit price across all confirmed fills.
+        original_size = pos.original_size if pos.original_size > 0 else pos.size
+        original_notional = (
+            pos.original_notional if pos.original_notional > 0 else pos.notional
+        )
+        total_closed_size = pos.realized_close_size + pos.size
+        weighted_exit_value = pos.realized_exit_value + pos.size * exit_price
+        average_exit_price = (
+            weighted_exit_value / total_closed_size
+            if total_closed_size > 0 else exit_price
+        )
 
         total_fees = pos.fees_paid + fees
         net_pnl = pnl - total_fees
-        pnl_pct = (net_pnl / (pos.notional / pos.leverage)) * 100 if pos.notional else 0
+        initial_margin = original_notional / pos.leverage if pos.leverage else original_notional
+        pnl_pct = (net_pnl / initial_margin) * 100 if initial_margin else 0
 
         trade = {
             "symbol": symbol,
             "side": pos.side,
             "entry_price": pos.entry_price,
-            "exit_price": exit_price,
-            "size": pos.size,
-            "notional": pos.notional,
+            "exit_price": average_exit_price,
+            "size": original_size,
+            "notional": original_notional,
             "leverage": pos.leverage,
             "pnl": round(net_pnl, 4),
             "pnl_pct": round(pnl_pct, 2),
@@ -258,6 +279,55 @@ class PositionManager:
             **{k: v for k, v in trade.items() if k != "reasoning"},
         )
         return trade
+
+    def reduce_position(
+        self,
+        symbol: str,
+        reduced_size: float,
+        exit_price: float,
+        fees: float = 0,
+    ) -> float:
+        """Apply an exchange-confirmed partial close and return remaining size.
+
+        Realized PnL and fees are retained on the open position so the final
+        close record includes every confirmed partial execution.
+        """
+        pos = self._positions.get(symbol)
+        if pos is None or reduced_size <= 0 or pos.size <= 0:
+            return pos.size if pos is not None else 0.0
+
+        actual_size = min(float(reduced_size), pos.size)
+        fraction = actual_size / pos.size
+        closed_notional = pos.notional * fraction
+
+        if pos.entry_price > 0:
+            if pos.side == "long":
+                realized = (exit_price - pos.entry_price) / pos.entry_price * closed_notional
+            else:
+                realized = (pos.entry_price - exit_price) / pos.entry_price * closed_notional
+            pos.realized_pnl += realized
+
+        pos.realized_close_size += actual_size
+        pos.realized_exit_value += actual_size * exit_price
+        pos.size = max(0.0, pos.size - actual_size)
+        pos.notional = max(0.0, pos.notional - closed_notional)
+        pos.fees_paid += max(0.0, fees)
+
+        # Avoid leaving a floating-point dust position after a full fill.
+        tolerance = max(actual_size * 1e-10, 1e-12)
+        if pos.size <= tolerance:
+            pos.size = 0.0
+            pos.notional = 0.0
+
+        log.info(
+            "position_partially_reduced",
+            symbol=symbol,
+            reduced_size=actual_size,
+            remaining_size=pos.size,
+            realized_pnl=pos.realized_pnl,
+            fees_paid=pos.fees_paid,
+        )
+        return pos.size
 
     def update_prices(self, prices: dict[str, float]) -> None:
         """Update all position prices from latest market data."""
