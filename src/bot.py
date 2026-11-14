@@ -356,6 +356,30 @@ class TradingBot:
         finally:
             await self.shutdown()
 
+    async def _halt_on_trigger_exit_failure(self, symbol: str, reason: str, result, detail: str) -> None:
+        """Halt new entries and alert when an SL/TP close is not fully confirmed."""
+        self.circuit_breakers._halt_trading(600)
+        try:
+            await self.telegram.send_circuit_breaker_alert(
+                "protective_exit_close_failed",
+                "HALT_NEW",
+                (
+                    f"{reason} close for {symbol} was not fully confirmed: {detail}. "
+                    f"Order: {getattr(result, 'order_id', '') or 'unknown'}; "
+                    f"status: {getattr(result, 'order_status', '') or 'unknown'}; "
+                    f"filled: {getattr(result, 'filled_size', 0)}; "
+                    f"remaining reported: {getattr(result, 'remaining_size', 0)}. "
+                    "New entries halted for 10 minutes; reconcile exchange exposure."
+                ),
+            )
+        except Exception as alert_error:
+            log.error(
+                "protective_exit_failure_alert_failed",
+                symbol=symbol,
+                reason=reason,
+                error=str(alert_error),
+            )
+
     async def _process_exit_triggers(self, ws_prices: dict[str, float]) -> None:
         """Close positions whose local SL/TP trigger has fired.
 
@@ -381,14 +405,21 @@ class TradingBot:
                     symbol=symbol,
                     error=result.error,
                 )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "stop_loss", result, result.error or "close not confirmed",
+                )
                 continue
 
             trade = result.trade_record
             if not trade:
+                detail = "exchange close was reported successful but no trade record was returned"
                 log.error(
                     "stop_loss_close_missing_trade_record",
                     symbol=symbol,
                     order_id=result.order_id,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "stop_loss", result, detail,
                 )
                 continue
 
@@ -433,14 +464,21 @@ class TradingBot:
                     symbol=symbol,
                     error=result.error,
                 )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "take_profit", result, result.error or "close not confirmed",
+                )
                 continue
 
             trade = result.trade_record
             if not trade:
+                detail = "exchange close was reported successful but no trade record was returned"
                 log.error(
                     "take_profit_close_missing_trade_record",
                     symbol=symbol,
                     order_id=result.order_id,
+                )
+                await self._halt_on_trigger_exit_failure(
+                    symbol, "take_profit", result, detail,
                 )
                 continue
 
