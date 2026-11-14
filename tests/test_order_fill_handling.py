@@ -166,6 +166,11 @@ async def test_ambiguous_order_without_terminal_status_is_not_assumed_filled() -
     position = position_manager.get_position(SYMBOL)
     assert not result.success
     assert "terminal state" in result.error
+    assert result.state_uncertain
+    assert result.order_id == "close-unknown"
+    assert result.order_status == "unknown"
+    assert result.filled_size == 0
+    assert result.remaining_size == pytest.approx(0.01)
     assert position is not None
     assert position.size == pytest.approx(0.01)
     assert exchange.fetch_calls == [("close-unknown", SYMBOL)]
@@ -380,3 +385,30 @@ async def test_partial_emergency_close_keeps_unfilled_remainder_tracked() -> Non
     assert results[0].remaining_size == pytest.approx(0.006)
     assert position is not None
     assert position.size == pytest.approx(0.006)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_emergency_close_preserves_max_possible_exposure_and_order_id() -> None:
+    position_manager = position_manager_mod.PositionManager()
+    _open_position(position_manager)
+    exchange = StubExchange(create_orders=[{
+        "id": "emergency-unknown",
+        "amount": 0.01,
+        "filled": 0.004,
+    }])
+    executor = executor_mod.TradeExecutor(exchange, position_manager, paper_mode=False)
+
+    results = await executor.emergency_close_all()
+
+    assert len(results) == 1
+    result = results[0]
+    assert not result.success
+    assert result.state_uncertain
+    assert result.order_id == "emergency-unknown"
+    assert result.order_status == "unknown"
+    assert result.filled_size == 0
+    assert result.remaining_size == pytest.approx(0.01)
+    assert "may remain exposed" in result.error
+    position = position_manager.get_position(SYMBOL)
+    assert position is not None
+    assert position.size == pytest.approx(0.01)
