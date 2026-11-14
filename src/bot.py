@@ -496,6 +496,70 @@ class TradingBot:
                 reasoning="Take-profit hit",
             )
 
+    async def _process_margin_force_close(self, symbol: str, current_price: float) -> None:
+        """Close a margin-unsafe position only after exchange fill confirmation."""
+        result = await self.executor.close_position_for_trigger(
+            symbol=symbol,
+            current_price=current_price,
+            reason="margin_buffer_force_close",
+        )
+
+        if not result.success or not result.trade_record:
+            error = result.error or "Exchange close returned no completed trade record"
+            uncertain = getattr(result, "state_uncertain", False)
+            halt_seconds = 3600 if uncertain else 600
+            remaining_note = (
+                f"up to {result.remaining_size} may remain exposed; "
+                "actual exchange exposure is unknown"
+                if uncertain else f"remaining open: {result.remaining_size}"
+            )
+            log.critical(
+                "margin_buffer_exchange_close_failed",
+                symbol=symbol,
+                order_id=result.order_id,
+                order_status=result.order_status,
+                filled_size=result.filled_size,
+                remaining_size=result.remaining_size,
+                state_uncertain=uncertain,
+                error=error,
+            )
+            # Unknown or partial close leaves exposure unresolved; block new entries.
+            self.circuit_breakers._halt_trading(halt_seconds)
+            try:
+                await self.telegram.send_circuit_breaker_alert(
+                    "margin_force_close_failed",
+                    "HALT_NEW",
+                    (
+                        f"Margin force-close for {symbol} was not fully confirmed: "
+                        f"{error}. Order: {result.order_id or 'unknown'}; "
+                        f"status: {result.order_status or 'unknown'}; "
+                        f"confirmed filled: {result.filled_size}; "
+                        f"{remaining_note}. New entries halted for {halt_seconds} seconds."
+                    ),
+                )
+            except Exception as alert_error:
+                log.error(
+                    "margin_force_close_alert_failed",
+                    symbol=symbol,
+                    error=str(alert_error),
+                )
+            return
+
+        trade = result.trade_record
+        exit_price = result.price or current_price
+        self.memory.record_trade(trade)
+        await self.db.save_trade(trade)
+        await self.telegram.notify_trade_close(
+            symbol=symbol,
+            side=trade["side"],
+            entry_price=trade["entry_price"],
+            exit_price=exit_price,
+            pnl=trade["pnl"],
+            pnl_pct=trade["pnl_pct"],
+            duration=trade.get("duration", "N/A"),
+            reasoning="Margin liquidation-buffer force-close",
+        )
+
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
         now = time.time()
@@ -589,10 +653,7 @@ class TradingBot:
                         buffer=force_buf,
                     )
                     price = ws_prices.get(worst.symbol, worst.mark_price)
-                    trade = self.position_manager.close_position(worst.symbol, price, 0)
-                    if trade:
-                        self.memory.record_trade(trade)
-                        await self.db.save_trade(trade)
+                    await self._process_margin_force_close(worst.symbol, price)
             except Exception as e:
                 # Silent-failure-hunter P0 #1: don't swallow — set state to None
                 # (forces context_builder to omit ACCOUNT_MARGIN) and escalate.
