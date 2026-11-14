@@ -368,3 +368,231 @@ async def test_unknown_margin_force_close_reports_uncertain_exposure_and_longer_
     assert alert[1] == "HALT_NEW"
     assert "up to 1.0 may remain exposed" in alert[2]
     assert "actual exchange exposure is unknown" in alert[2]
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_emergency_close_records_and_notifies_confirmed_trade() -> None:
+    trade = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "entry_price": 100_000.0,
+        "exit_price": 95_000.0,
+        "pnl": -50.0,
+        "pnl_pct": -10.0,
+        "duration": "30m",
+    }
+    result = ExecutionResult(
+        success=True,
+        action="emergency_close",
+        symbol=trade["symbol"],
+        side="long",
+        price=94_950.0,
+        order_id="emergency-close-1",
+        order_status="closed",
+        filled_size=0.01,
+        remaining_size=0.0,
+        trade_record=trade,
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.memory = SimpleNamespace(record_trade=Mock())
+    bot.db = SimpleNamespace(save_trade=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_emergency_close_results([result], "portfolio drawdown")
+
+    bot.memory.record_trade.assert_called_once_with(trade)
+    bot.db.save_trade.assert_awaited_once_with(trade)
+    bot.telegram.notify_trade_close.assert_awaited_once_with(
+        symbol="BTC/USDT:USDT",
+        side="long",
+        entry_price=100_000.0,
+        exit_price=94_950.0,
+        pnl=-50.0,
+        pnl_pct=-10.0,
+        duration="30m",
+        reasoning="Circuit-breaker emergency close: portfolio drawdown",
+    )
+    bot.telegram.send_circuit_breaker_alert.assert_not_awaited()
+    bot.circuit_breakers._halt_trading.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_partial_emergency_close_is_alerted_and_not_recorded_as_completed() -> None:
+    result = ExecutionResult(
+        success=False,
+        action="emergency_close",
+        symbol="ETH/USDT:USDT",
+        side="short",
+        order_id="emergency-close-partial",
+        order_status="canceled",
+        filled_size=0.25,
+        remaining_size=0.75,
+        error="Emergency close partially filled: 0.25 of 1.0; 0.75 remains open",
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.memory = SimpleNamespace(record_trade=Mock())
+    bot.db = SimpleNamespace(save_trade=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_emergency_close_results([result], "websocket disconnected")
+
+    bot.memory.record_trade.assert_not_called()
+    bot.db.save_trade.assert_not_awaited()
+    bot.telegram.notify_trade_close.assert_not_awaited()
+    bot.circuit_breakers._halt_trading.assert_called_once_with(3600)
+    bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
+    alert_args = bot.telegram.send_circuit_breaker_alert.await_args.args
+    assert alert_args[0] == "emergency_close_incomplete"
+    assert alert_args[1] == "HALT_NEW"
+    assert "0.75" in alert_args[2]
+
+
+@pytest.mark.asyncio
+async def test_emergency_close_batch_continues_and_flags_missing_trade_record() -> None:
+    trade = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "entry_price": 100_000.0,
+        "exit_price": 99_500.0,
+        "pnl": -5.0,
+        "pnl_pct": -1.0,
+    }
+    confirmed = ExecutionResult(
+        success=True,
+        action="emergency_close",
+        symbol=trade["symbol"],
+        side="long",
+        price=99_500.0,
+        order_status="closed",
+        filled_size=0.01,
+        remaining_size=0.0,
+        trade_record=trade,
+    )
+    unaccounted = ExecutionResult(
+        success=True,
+        action="emergency_close",
+        symbol="ETH/USDT:USDT",
+        side="short",
+        order_id="emergency-close-no-record",
+        order_status="closed",
+        filled_size=1.0,
+        remaining_size=0.0,
+        trade_record=None,
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.memory = SimpleNamespace(record_trade=Mock())
+    bot.db = SimpleNamespace(save_trade=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_emergency_close_results(
+        [confirmed, unaccounted], "portfolio drawdown",
+    )
+
+    bot.memory.record_trade.assert_called_once_with(trade)
+    bot.db.save_trade.assert_awaited_once_with(trade)
+    bot.telegram.notify_trade_close.assert_awaited_once()
+    bot.circuit_breakers._halt_trading.assert_called_once_with(3600)
+    bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
+    alert = bot.telegram.send_circuit_breaker_alert.await_args.args
+    assert alert[0] == "emergency_close_incomplete"
+    assert alert[1] == "HALT_NEW"
+    assert "without a completed trade record" in alert[2]
+    assert "Trigger: portfolio drawdown" in alert[2]
+
+
+@pytest.mark.asyncio
+async def test_emergency_close_reporting_errors_halt_and_alert_after_all_attempts() -> None:
+    trade = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "entry_price": 100_000.0,
+        "exit_price": 99_500.0,
+        "pnl": -5.0,
+        "pnl_pct": -1.0,
+    }
+    result = ExecutionResult(
+        success=True,
+        action="emergency_close",
+        symbol=trade["symbol"],
+        side="long",
+        price=99_500.0,
+        order_status="closed",
+        filled_size=0.01,
+        remaining_size=0.0,
+        trade_record=trade,
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.memory = SimpleNamespace(
+        record_trade=Mock(side_effect=RuntimeError("memory unavailable"))
+    )
+    bot.db = SimpleNamespace(
+        save_trade=AsyncMock(side_effect=RuntimeError("database unavailable"))
+    )
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(side_effect=RuntimeError("telegram unavailable")),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_emergency_close_results([result], "drawdown")
+
+    bot.memory.record_trade.assert_called_once_with(trade)
+    bot.db.save_trade.assert_awaited_once_with(trade)
+    bot.telegram.notify_trade_close.assert_awaited_once()
+    bot.circuit_breakers._halt_trading.assert_called_once_with(3600)
+    bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
+    alert = bot.telegram.send_circuit_breaker_alert.await_args.args
+    assert alert[0] == "emergency_close_reporting_failed"
+    assert alert[1] == "HALT_NEW"
+    assert "memory: memory unavailable" in alert[2]
+    assert "database: database unavailable" in alert[2]
+    assert "telegram: telegram unavailable" in alert[2]
+
+
+@pytest.mark.asyncio
+async def test_unknown_emergency_close_reports_max_possible_exposure() -> None:
+    result = ExecutionResult(
+        success=False,
+        action="emergency_close",
+        symbol="ETH/USDT:USDT",
+        side="short",
+        order_id="emergency-close-unknown",
+        order_status="open",
+        filled_size=0.0,
+        remaining_size=0.75,
+        state_uncertain=True,
+        error="Exchange order outcome is unknown; up to 0.75 may remain exposed",
+    )
+    bot = TradingBot.__new__(TradingBot)
+    bot.memory = SimpleNamespace(record_trade=Mock())
+    bot.db = SimpleNamespace(save_trade=AsyncMock())
+    bot.telegram = SimpleNamespace(
+        notify_trade_close=AsyncMock(),
+        send_circuit_breaker_alert=AsyncMock(),
+    )
+    bot.circuit_breakers = SimpleNamespace(_halt_trading=Mock())
+
+    await bot._process_emergency_close_results([result], "exchange timeout")
+
+    bot.circuit_breakers._halt_trading.assert_called_once_with(3600)
+    bot.memory.record_trade.assert_not_called()
+    bot.db.save_trade.assert_not_awaited()
+    bot.telegram.notify_trade_close.assert_not_awaited()
+    bot.telegram.send_circuit_breaker_alert.assert_awaited_once()
+    alert = bot.telegram.send_circuit_breaker_alert.await_args.args
+    assert alert[0] == "emergency_close_incomplete"
+    assert alert[1] == "HALT_NEW"
+    assert "up to 0.75 may remain exposed" in alert[2]
+    assert "actual exchange exposure is unknown" in alert[2]
